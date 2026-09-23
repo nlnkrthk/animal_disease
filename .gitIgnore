@@ -1,1 +1,11 @@
-/ml/saved_models/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large binary model files are tracked via Git LFS (.cbm, .pkl)
+# DO NOT ignore ml/saved_models/ - these are required by Streamlit Cloud
