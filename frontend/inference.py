@@ -22,8 +22,18 @@ FRONTEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = FRONTEND_DIR.parent
 SAVED_MODELS_DIR = PROJECT_ROOT / "ml" / "saved_models"
 MODEL_PATH = SAVED_MODELS_DIR / "catboost_final.cbm"
+CONFIG_PATH = SAVED_MODELS_DIR / "preprocessor_config.json"
 ASSETS_PATH = SAVED_MODELS_DIR / "preprocessing_assets.pkl"
 LABEL_ENCODER_PATH = SAVED_MODELS_DIR / "label_encoder.pkl"
+
+
+class SimpleLabelEncoder:
+    """Lightweight label encoder that does not require scikit-learn unpickling."""
+    def __init__(self, classes: List[str]):
+        self.classes_ = np.array(classes)
+
+    def inverse_transform(self, indices: Any) -> np.ndarray:
+        return np.array([self.classes_[int(i)] for i in indices])
 
 MONTH_MAP = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
@@ -159,19 +169,34 @@ class DiseasePredictor:
         self.model = CatBoostClassifier()
         self.model.load_model(str(MODEL_PATH))
 
-        if not ASSETS_PATH.exists() or not LABEL_ENCODER_PATH.exists():
+        if CONFIG_PATH.exists():
+            logger.info(f"Loading preprocessing configuration from {CONFIG_PATH} (JSON engine)...")
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            self.common_species = set(config["common_species"])
+            self.country_freq = config["country_freq"]
+            self.label_encoder = SimpleLabelEncoder(config["classes"])
+            self.categorical_cols = config["categorical_cols"]
+            self.categories = [list(c) for c in config["categories"]]
+            self.numeric_cols = config["numeric_cols"]
+            self.scaler_mean = np.array(config["scaler_mean"], dtype=np.float64)
+            self.scaler_scale = np.array(config["scaler_scale"], dtype=np.float64)
+            self.use_json_engine = True
+            logger.info("JSON-based preprocessor and label encoder loaded successfully.")
+        elif ASSETS_PATH.exists() and LABEL_ENCODER_PATH.exists():
+            logger.info("Loading preprocessing assets and label encoder from pickle...")
+            assets = joblib.load(str(ASSETS_PATH))
+            self.preprocessor = assets["preprocessor"]
+            self.country_freq = assets["country_freq"]
+            self.common_species = assets["common_species"]
+            self.label_encoder = joblib.load(str(LABEL_ENCODER_PATH))
+            self.use_json_engine = False
+            logger.info("Pickled assets loaded successfully.")
+        else:
             raise FileNotFoundError(
-                f"Assets missing at {ASSETS_PATH} or {LABEL_ENCODER_PATH}. "
-                "Ensure saved_models contains preprocessing_assets.pkl and label_encoder.pkl"
+                f"Missing configuration at {CONFIG_PATH} or {ASSETS_PATH}. "
+                "Ensure preprocessor_config.json or preprocessing_assets.pkl is present."
             )
-
-        logger.info("Loading preprocessing assets and label encoder...")
-        assets = joblib.load(str(ASSETS_PATH))
-        self.preprocessor = assets["preprocessor"]
-        self.country_freq = assets["country_freq"]
-        self.common_species = assets["common_species"]
-        self.label_encoder = joblib.load(str(LABEL_ENCODER_PATH))
-        logger.info("All model artifacts loaded successfully.")
 
     def preprocess_df(self, df: pd.DataFrame) -> np.ndarray:
         """
@@ -210,19 +235,31 @@ class DiseasePredictor:
         data["susceptible"] = pd.to_numeric(data["susceptible"], errors="coerce").fillna(0)
         data["susceptible"] = np.log1p(np.maximum(data["susceptible"], 0))
 
-        # Ensure correct column ordering for ColumnTransformer
-        # Categorical: species_name, causal_agent_type, season, epi_unit_type
-        # Numeric: is_wild, is_domestic, is_aquatic, latitude, longitude, susceptible, country_freq, month_sin, month_cos
-        cols = [
-            "species_name", "causal_agent_type", "season", "epi_unit_type",
-            "is_wild", "is_domestic", "is_aquatic", "latitude", "longitude",
-            "susceptible", "country_freq", "month_sin", "month_cos"
-        ]
-        data = data[cols]
+        if getattr(self, "use_json_engine", False):
+            n_rows = len(data)
+            cat_matrices = []
+            for col, cats in zip(self.categorical_cols, self.categories):
+                col_vals = data[col].astype(str).values
+                cat_map = {c: i for i, c in enumerate(cats)}
+                oh = np.zeros((n_rows, len(cats)), dtype=np.float64)
+                for r, v in enumerate(col_vals):
+                    if v in cat_map:
+                        oh[r, cat_map[v]] = 1.0
+                cat_matrices.append(oh)
+            cat_encoded = np.hstack(cat_matrices) if cat_matrices else np.empty((n_rows, 0))
 
-        # Apply preprocessor
-        encoded = self.preprocessor.transform(data)
-        return encoded
+            num_mat = data[self.numeric_cols].to_numpy(dtype=np.float64)
+            num_scaled = (num_mat - self.scaler_mean) / self.scaler_scale
+            return np.hstack([cat_encoded, num_scaled])
+        else:
+            cols = [
+                "species_name", "causal_agent_type", "season", "epi_unit_type",
+                "is_wild", "is_domestic", "is_aquatic", "latitude", "longitude",
+                "susceptible", "country_freq", "month_sin", "month_cos"
+            ]
+            data = data[cols]
+            encoded = self.preprocessor.transform(data)
+            return encoded
 
     def predict_single(self, input_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
